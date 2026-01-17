@@ -22,7 +22,13 @@ impl fmt::Display for Amount {
         let abs = self.0.abs();
         let whole = abs / Self::SCALE;
         let frac = abs % Self::SCALE;
-        write!(f, "{sign}{whole}.{frac:04}")
+        if frac == 0 {
+            write!(f, "{sign}{whole}")
+        } else {
+            let frac_str = format!("{frac:04}");
+            let trimmed = frac_str.trim_end_matches('0');
+            write!(f, "{sign}{whole}.{trimmed}")
+        }
     }
 }
 
@@ -76,15 +82,15 @@ mod tests {
 
     #[test]
     fn display_formats_positive() {
-        assert_eq!(Amount::from_scaled(1_000_000).to_string(), "100.0000");
-        assert_eq!(Amount::from_scaled(15_000).to_string(), "1.5000");
+        assert_eq!(Amount::from_scaled(1_000_000).to_string(), "100");
+        assert_eq!(Amount::from_scaled(15_000).to_string(), "1.5");
         assert_eq!(Amount::from_scaled(1).to_string(), "0.0001");
-        assert_eq!(Amount::from_scaled(0).to_string(), "0.0000");
+        assert_eq!(Amount::from_scaled(0).to_string(), "0");
     }
 
     #[test]
     fn display_formats_negative() {
-        assert_eq!(Amount::from_scaled(-502_500).to_string(), "-50.2500");
+        assert_eq!(Amount::from_scaled(-502_500).to_string(), "-50.25");
         assert_eq!(Amount::from_scaled(-1).to_string(), "-0.0001");
     }
 
