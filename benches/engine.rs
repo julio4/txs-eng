@@ -50,17 +50,17 @@ impl Iterator for TxGenerator {
             0 => Transaction::Deposit {
                 client: self.current_client,
                 tx: tx_id,
-                amount: Amount::from_scaled(1000), // 100.0
+                amount: Amount::from_scaled(1_000_000), // 100.0
             },
             1 => Transaction::Deposit {
                 client: self.current_client,
                 tx: tx_id,
-                amount: Amount::from_scaled(500), // 50.0
+                amount: Amount::from_scaled(500_000), // 50.0
             },
             _ => Transaction::Withdrawal {
                 client: self.current_client,
                 tx: tx_id,
-                amount: Amount::from_scaled(300), // 30.0
+                amount: Amount::from_scaled(300_000), // 30.0
             },
         };
 

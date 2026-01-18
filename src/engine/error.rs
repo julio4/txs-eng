@@ -14,14 +14,8 @@ pub enum EngineError {
     #[error("withdrawal failed: {0}")]
     Withdrawal(#[from] WithdrawalError),
 
-    #[error("dispute failed: {0}")]
-    Dispute(#[from] DisputeError),
-
-    #[error("resolve failed: {0}")]
-    Resolve(#[from] ResolveError),
-
-    #[error("chargeback failed: {0}")]
-    Chargeback(#[from] ChargebackError),
+    #[error("{0}")]
+    DepositOperation(#[from] DepositOperationError),
 }
 
 /// Error during deposit processing.
@@ -44,44 +38,26 @@ pub enum WithdrawalError {
     DuplicateTxId(TxId),
 }
 
-/// Error during dispute processing.
-#[derive(Debug, Error)]
-pub enum DisputeError {
-    #[error("deposit {0} not found")]
-    TxNotFound(TxId),
-    #[error("client mismatch: deposit {0} belongs to client {1}, not {2}")]
-    ClientMismatch(TxId, ClientId, ClientId),
-    #[error("deposit {0} already disputed")]
-    AlreadyDisputed(TxId),
-    /// Internal error
-    #[error("client {0} not found")]
-    ClientNotFound(ClientId),
+/// The type of deposit operation being performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepositOperation {
+    Dispute,
+    Resolve,
+    Chargeback,
 }
 
-/// Error during resolve processing.
+/// Unified error for deposit operations (dispute, resolve, chargeback).
 #[derive(Debug, Error)]
-pub enum ResolveError {
-    #[error("deposit {0} not found")]
-    TxNotFound(TxId),
-    #[error("client mismatch: deposit {0} belongs to client {1}, not {2}")]
-    ClientMismatch(TxId, ClientId, ClientId),
-    #[error("deposit {0} is not disputed")]
-    NotDisputed(TxId),
-    /// Internal error
-    #[error("client {0} not found")]
-    ClientNotFound(ClientId),
-}
+pub enum DepositOperationError {
+    #[error("{0:?}: deposit {1} not found")]
+    TxNotFound(DepositOperation, TxId),
 
-/// Error during chargeback processing.
-#[derive(Debug, Error)]
-pub enum ChargebackError {
-    #[error("deposit {0} not found")]
-    TxNotFound(TxId),
-    #[error("client mismatch: deposit {0} belongs to client {1}, not {2}")]
-    ClientMismatch(TxId, ClientId, ClientId),
-    #[error("deposit {0} is not disputed")]
-    NotDisputed(TxId),
-    /// Internal error
-    #[error("client {0} not found")]
-    ClientNotFound(ClientId),
+    #[error("{0:?}: deposit {1} belongs to client {2}, not {3}")]
+    ClientMismatch(DepositOperation, TxId, ClientId, ClientId),
+
+    #[error("{0:?}: deposit {1} is not in expected state")]
+    InvalidState(DepositOperation, TxId),
+
+    #[error("{0:?}: client {1} not found")]
+    ClientNotFound(DepositOperation, ClientId),
 }

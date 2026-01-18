@@ -1,7 +1,7 @@
 use std::env;
 
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::warn;
+use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 use txs_eng::Engine;
 use txs_eng::csv::{read_transactions, write_accounts};
@@ -25,10 +25,21 @@ async fn main() {
     let (tx_sender, tx_receiver) = tokio::sync::mpsc::channel(16);
 
     tokio::spawn(async move {
-        for result in read_transactions(&path) {
+        let transactions = match read_transactions(&path) {
+            Ok(iter) => iter,
+            Err(e) => {
+                error!("failed to open transactions file: {e}");
+                return;
+            }
+        };
+
+        for result in transactions {
             match result {
                 Ok(tx) => {
-                    tx_sender.send(tx).await.unwrap();
+                    if tx_sender.send(tx).await.is_err() {
+                        // Receiver dropped, stop sending
+                        break;
+                    }
                 }
                 Err(e) => {
                     warn!("{e}");

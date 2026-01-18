@@ -5,6 +5,7 @@ use std::io;
 use std::path::Path;
 use thiserror::Error;
 
+use crate::engine::ClientAccount;
 use crate::{Amount, ClientId, Transaction, TxId};
 
 /// Errors that can occur when parsing CSV rows.
@@ -43,13 +44,16 @@ struct OutputRow {
 /// Invalid rows are returned as errors; valid rows continue to be processed.
 pub fn read_transactions(
     path: impl AsRef<Path>,
-) -> impl Iterator<Item = Result<Transaction, CsvError>> {
+) -> Result<impl Iterator<Item = Result<Transaction, CsvError>>, io::Error> {
     let reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .from_path(path)
-        .expect("failed to open csv file");
+        .map_err(|e| match e.into_kind() {
+            csv::ErrorKind::Io(io_err) => io_err,
+            _ => io::Error::other("csv error"),
+        })?;
 
-    reader
+    Ok(reader
         .into_deserialize::<InputRow>()
         .enumerate()
         .map(|(idx, result)| {
@@ -95,25 +99,23 @@ pub fn read_transactions(
                     tx_type: other.to_string(),
                 }),
             }
-        })
+        }))
 }
 
 /// Write client accounts to stdout in CSV format.
 ///
 /// Output columns: client, available, held, total, locked
-pub fn write_accounts(
-    accounts: impl IntoIterator<Item = (ClientId, Amount, Amount, Amount, bool)>,
-) {
+pub fn write_accounts<'a>(accounts: impl IntoIterator<Item = &'a ClientAccount>) {
     let stdout = io::stdout();
     let mut writer = csv::Writer::from_writer(stdout.lock());
 
-    for (client, available, held, total, locked) in accounts {
+    for account in accounts {
         let row = OutputRow {
-            client,
-            available: available.to_string(),
-            held: held.to_string(),
-            total: total.to_string(),
-            locked,
+            client: account.id(),
+            available: account.available().to_string(),
+            held: account.held().to_string(),
+            total: account.total().to_string(),
+            locked: account.is_frozen(),
         };
         writer.serialize(&row).expect("failed to write csv row");
     }
@@ -136,7 +138,7 @@ mod tests {
     #[test]
     fn read_deposit() {
         let file = write_csv("type,client,tx,amount\ndeposit,1,1,10.5\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
 
         let tx = results.into_iter().next().unwrap().unwrap();
@@ -153,7 +155,7 @@ mod tests {
     #[test]
     fn read_withdrawal() {
         let file = write_csv("type,client,tx,amount\nwithdrawal,2,3,5.25\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
 
         let tx = results.into_iter().next().unwrap().unwrap();
@@ -170,7 +172,7 @@ mod tests {
     #[test]
     fn read_with_whitespace() {
         let file = write_csv("type, client, tx, amount\ndeposit, 1, 1, 10.0\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
     }
@@ -178,7 +180,7 @@ mod tests {
     #[test]
     fn read_returns_error_for_unknown_type() {
         let file = write_csv("type,client,tx,amount\nunknown,1,1,10.0\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
         let err = results[0].as_ref().unwrap_err();
         assert!(matches!(err, CsvError::UnrecognizedType { line: 2, .. }));
@@ -187,7 +189,7 @@ mod tests {
     #[test]
     fn read_returns_error_for_missing_amount() {
         let file = write_csv("type,client,tx,amount\ndeposit,1,1,\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
         let err = results[0].as_ref().unwrap_err();
         assert!(matches!(err, CsvError::MissingAmount { line: 2, .. }));
@@ -196,7 +198,7 @@ mod tests {
     #[test]
     fn read_dispute() {
         let file = write_csv("type,client,tx,amount\ndispute,1,5,\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
 
         let tx = results.into_iter().next().unwrap().unwrap();
@@ -212,7 +214,7 @@ mod tests {
     #[test]
     fn read_resolve() {
         let file = write_csv("type,client,tx,amount\nresolve,2,10,\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
 
         let tx = results.into_iter().next().unwrap().unwrap();
@@ -228,7 +230,7 @@ mod tests {
     #[test]
     fn read_chargeback() {
         let file = write_csv("type,client,tx,amount\nchargeback,3,15,\n");
-        let results: Vec<_> = read_transactions(file.path()).collect();
+        let results: Vec<_> = read_transactions(file.path()).unwrap().collect();
         assert_eq!(results.len(), 1);
 
         let tx = results.into_iter().next().unwrap().unwrap();

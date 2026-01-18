@@ -2,7 +2,7 @@
 //!
 //! The engine processes transactions and maintains client account state.
 //! It supports deposits, withdrawals, disputes, resolutions, and chargebacks.
-//! Also supports  async stream of transactions.
+//! Also supports async stream of transactions.
 
 use std::collections::{HashMap, HashSet};
 use tokio_stream::{Stream, StreamExt};
@@ -12,11 +12,11 @@ use crate::Amount;
 use crate::model::{ClientId, DepositRecord, DepositState, Transaction, TxId};
 
 mod state;
-use state::ClientAccount;
+pub use state::ClientAccount;
 
 mod error;
 pub use error::{
-    ChargebackError, DepositError, DisputeError, EngineError, ResolveError, WithdrawalError,
+    DepositError, DepositOperation, DepositOperationError, EngineError, WithdrawalError,
 };
 
 /// The transaction processing engine.
@@ -48,17 +48,9 @@ impl Engine {
         }
     }
 
-    /// Return the state of client accounts flattened by client identifier
-    pub fn clients(&self) -> impl Iterator<Item = (ClientId, Amount, Amount, Amount, bool)> + '_ {
-        self.clients.iter().map(|(id, account)| {
-            (
-                *id,
-                account.available,
-                account.held,
-                account.total(),
-                account.frozen,
-            )
-        })
+    /// Return the state of client accounts.
+    pub fn clients(&self) -> impl Iterator<Item = &ClientAccount> + '_ {
+        self.clients.values()
     }
 
     /// Return the state of one client account
@@ -165,12 +157,16 @@ impl Engine {
             return Err(DepositError::DuplicateTxId(tx));
         }
 
-        let account = self.clients.entry(client).or_default();
-        if account.frozen {
+        let account = self
+            .clients
+            .entry(client)
+            .or_insert_with(|| ClientAccount::new(client));
+
+        if account.is_frozen() {
             return Err(DepositError::AccountFrozen(client));
         }
 
-        account.available += amount;
+        account.credit(amount);
 
         // Store deposit for potential disputes
         self.deposits.insert(tx, DepositRecord::new(client, amount));
@@ -192,20 +188,24 @@ impl Engine {
             return Err(WithdrawalError::DuplicateTxId(tx));
         }
 
-        let account = self.clients.entry(client).or_default();
-        if account.frozen {
+        let account = self
+            .clients
+            .entry(client)
+            .or_insert_with(|| ClientAccount::new(client));
+
+        if account.is_frozen() {
             return Err(WithdrawalError::AccountFrozen(client));
         }
 
-        if account.available < amount {
+        if account.available() < amount {
             return Err(WithdrawalError::InsufficientFunds(
                 client,
-                account.available,
+                account.available(),
                 amount,
             ));
         }
 
-        account.available -= amount;
+        account.debit(amount);
 
         // Store only tx ID for duplicate checking (as withdrawals can't be disputed)
         self.withdrawal_ids.insert(tx);
@@ -217,41 +217,52 @@ impl Engine {
     /// - Find the referenced deposit
     /// - Validate client ownership
     /// - Check deposit is in Ok state
-    /// - Move funds from available to held (requires sufficient available)
-    fn apply_dispute(&mut self, client: ClientId, tx: TxId) -> Result<(), DisputeError> {
+    /// - Move funds from available to held
+    ///
+    /// Note: Disputes may result in negative available balance if funds were
+    /// already withdrawn. This represents debt owed by the client.
+    fn apply_dispute(&mut self, client: ClientId, tx: TxId) -> Result<(), DepositOperationError> {
+        use DepositOperation::Dispute;
+
         // Only deposits can be disputed; other transaction types return "not found"
-        let record = self.deposits.get(&tx).ok_or(DisputeError::TxNotFound(tx))?;
+        let record = self
+            .deposits
+            .get_mut(&tx)
+            .ok_or(DepositOperationError::TxNotFound(Dispute, tx))?;
 
         // Validate client ownership
         if record.client != client {
-            return Err(DisputeError::ClientMismatch(tx, record.client, client));
+            return Err(DepositOperationError::ClientMismatch(
+                Dispute,
+                tx,
+                record.client,
+                client,
+            ));
         }
 
         // Check state (ChargedBack deposits are evicted, so not found)
         if record.state == DepositState::Disputed {
-            return Err(DisputeError::AlreadyDisputed(tx));
+            return Err(DepositOperationError::InvalidState(Dispute, tx));
         }
 
         let amount = record.amount;
+        record.state = DepositState::Disputed; // Update state in place (no second lookup)
+
         let account = self
             .clients
             .get_mut(&client)
-            .ok_or(DisputeError::ClientNotFound(client))?;
+            .ok_or(DepositOperationError::ClientNotFound(Dispute, client))?;
 
         // Move funds from available to held (may result in negative available balance)
-        if account.available < amount {
+        if account.available() < amount {
             warn!(
                 client = client,
-                available = %account.available,
+                available = %account.available(),
                 required = %amount,
                 "dispute will cause negative available balance"
             );
         }
-        account.available -= amount;
-        account.held += amount;
-
-        // Update deposit state
-        self.deposits.get_mut(&tx).unwrap().state = DepositState::Disputed;
+        account.hold(amount);
 
         Ok(())
     }
@@ -261,31 +272,39 @@ impl Engine {
     /// - Validate client ownership
     /// - Check deposit is in Disputed state
     /// - Move funds from held back to available
-    fn apply_resolve(&mut self, client: ClientId, tx: TxId) -> Result<(), ResolveError> {
-        let record = self.deposits.get(&tx).ok_or(ResolveError::TxNotFound(tx))?;
+    fn apply_resolve(&mut self, client: ClientId, tx: TxId) -> Result<(), DepositOperationError> {
+        use DepositOperation::Resolve;
+
+        let record = self
+            .deposits
+            .get_mut(&tx)
+            .ok_or(DepositOperationError::TxNotFound(Resolve, tx))?;
 
         // Validate client ownership
         if record.client != client {
-            return Err(ResolveError::ClientMismatch(tx, record.client, client));
+            return Err(DepositOperationError::ClientMismatch(
+                Resolve,
+                tx,
+                record.client,
+                client,
+            ));
         }
 
         // Check state (ChargedBack deposits are evicted, so not found)
         if record.state == DepositState::Ok {
-            return Err(ResolveError::NotDisputed(tx));
+            return Err(DepositOperationError::InvalidState(Resolve, tx));
         }
 
         let amount = record.amount;
+        record.state = DepositState::Ok; // Update state in place (no second lookup)
+
         let account = self
             .clients
             .get_mut(&client)
-            .ok_or(ResolveError::ClientNotFound(client))?;
+            .ok_or(DepositOperationError::ClientNotFound(Resolve, client))?;
 
         // Move held back to available
-        account.held -= amount;
-        account.available += amount;
-
-        // Update deposit state back to Ok (can be disputed again)
-        self.deposits.get_mut(&tx).unwrap().state = DepositState::Ok;
+        account.release(amount);
 
         Ok(())
     }
@@ -296,30 +315,42 @@ impl Engine {
     /// - Check deposit is in Disputed state
     /// - Remove held funds (total decreases), freeze account
     /// - Evict deposit (terminal state, can never be referenced again)
-    fn apply_chargeback(&mut self, client: ClientId, tx: TxId) -> Result<(), ChargebackError> {
+    fn apply_chargeback(
+        &mut self,
+        client: ClientId,
+        tx: TxId,
+    ) -> Result<(), DepositOperationError> {
+        use DepositOperation::Chargeback;
+
         let record = self
             .deposits
             .get(&tx)
-            .ok_or(ChargebackError::TxNotFound(tx))?;
+            .ok_or(DepositOperationError::TxNotFound(Chargeback, tx))?;
 
         // Validate client ownership
         if record.client != client {
-            return Err(ChargebackError::ClientMismatch(tx, record.client, client));
+            return Err(DepositOperationError::ClientMismatch(
+                Chargeback,
+                tx,
+                record.client,
+                client,
+            ));
         }
 
         // Check state (ChargedBack deposits are evicted, so not found)
         if record.state == DepositState::Ok {
-            return Err(ChargebackError::NotDisputed(tx));
+            return Err(DepositOperationError::InvalidState(Chargeback, tx));
         }
 
         let amount = record.amount;
+
         let account = self
             .clients
             .get_mut(&client)
-            .ok_or(ChargebackError::ClientNotFound(client))?;
+            .ok_or(DepositOperationError::ClientNotFound(Chargeback, client))?;
 
         // Remove held funds (total decreases)
-        account.held -= amount;
+        account.remove_held(amount);
 
         // Freeze account and evict deposit (terminal state)
         account.freeze();
@@ -371,9 +402,9 @@ mod tests {
         engine.apply(deposit(1, 1, 100)).unwrap();
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(100));
-        assert_eq!(client.held, Amount::from_scaled(0));
-        assert!(!client.frozen);
+        assert_eq!(client.available(), Amount::from_scaled(100));
+        assert_eq!(client.held(), Amount::from_scaled(0));
+        assert!(!client.is_frozen());
     }
 
     #[test]
@@ -383,7 +414,7 @@ mod tests {
         engine.apply(deposit(1, 2, 50)).unwrap();
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(150));
+        assert_eq!(client.available(), Amount::from_scaled(150));
     }
 
     #[test]
@@ -400,7 +431,7 @@ mod tests {
 
         // Balance unchanged
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(100));
+        assert_eq!(client.available(), Amount::from_scaled(100));
     }
 
     // Withdrawal
@@ -412,7 +443,7 @@ mod tests {
         engine.apply(withdrawal(1, 2, 30)).unwrap();
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(70));
+        assert_eq!(client.available(), Amount::from_scaled(70));
     }
 
     #[test]
@@ -422,7 +453,7 @@ mod tests {
         engine.apply(withdrawal(1, 2, 100)).unwrap();
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(0));
+        assert_eq!(client.available(), Amount::from_scaled(0));
     }
 
     #[test]
@@ -442,7 +473,7 @@ mod tests {
 
         // Balance unchanged
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(100));
+        assert_eq!(client.available(), Amount::from_scaled(100));
     }
 
     #[test]
@@ -459,7 +490,7 @@ mod tests {
 
         // Balance unchanged
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(100));
+        assert_eq!(client.available(), Amount::from_scaled(100));
     }
 
     #[test]
@@ -490,8 +521,8 @@ mod tests {
         let client1 = engine.get_client(1).unwrap();
         let client2 = engine.get_client(2).unwrap();
 
-        assert_eq!(client1.available, Amount::from_scaled(70));
-        assert_eq!(client2.available, Amount::from_scaled(200));
+        assert_eq!(client1.available(), Amount::from_scaled(70));
+        assert_eq!(client2.available(), Amount::from_scaled(200));
     }
 
     // clients() iterator
@@ -506,11 +537,11 @@ mod tests {
         assert_eq!(clients.len(), 2);
 
         // Find each client (without any ordering guarantees)
-        let c1 = clients.iter().find(|(id, _, _, _, _)| *id == 1).unwrap();
-        let c2 = clients.iter().find(|(id, _, _, _, _)| *id == 2).unwrap();
+        let c1 = clients.iter().find(|c| c.id() == 1).unwrap();
+        let c2 = clients.iter().find(|c| c.id() == 2).unwrap();
 
-        assert_eq!(c1.1, Amount::from_scaled(100)); // available
-        assert_eq!(c2.1, Amount::from_scaled(200)); // available
+        assert_eq!(c1.available(), Amount::from_scaled(100));
+        assert_eq!(c2.available(), Amount::from_scaled(200));
     }
 
     //  Async run()
@@ -525,8 +556,8 @@ mod tests {
         let client1 = engine.get_client(1).unwrap();
         let client2 = engine.get_client(2).unwrap();
 
-        assert_eq!(client1.available, Amount::from_scaled(75));
-        assert_eq!(client2.available, Amount::from_scaled(200));
+        assert_eq!(client1.available(), Amount::from_scaled(75));
+        assert_eq!(client2.available(), Amount::from_scaled(200));
     }
 
     #[tokio::test]
@@ -542,7 +573,7 @@ mod tests {
 
         let client = engine.get_client(1).unwrap();
 
-        assert_eq!(client.available, Amount::from_scaled(150)); // 100 + 50 with withdrawal skipped
+        assert_eq!(client.available(), Amount::from_scaled(150)); // 100 + 50 with withdrawal skipped
     }
 
     // Dispute, Resolve, Chargeback - test utils
@@ -568,10 +599,10 @@ mod tests {
         engine.apply(dispute(1, 1)).unwrap();
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(0));
-        assert_eq!(client.held, Amount::from_scaled(100));
+        assert_eq!(client.available(), Amount::from_scaled(0));
+        assert_eq!(client.held(), Amount::from_scaled(100));
         assert_eq!(client.total(), Amount::from_scaled(100));
-        assert!(!client.frozen);
+        assert!(!client.is_frozen());
     }
 
     #[test]
@@ -584,13 +615,15 @@ mod tests {
         let result = engine.apply(dispute(1, 2));
         assert!(matches!(
             result,
-            Err(EngineError::Dispute(DisputeError::TxNotFound(2)))
+            Err(EngineError::DepositOperation(
+                DepositOperationError::TxNotFound(DepositOperation::Dispute, 2)
+            ))
         ));
 
         // Balance unchanged
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(60));
-        assert_eq!(client.held, Amount::from_scaled(0));
+        assert_eq!(client.available(), Amount::from_scaled(60));
+        assert_eq!(client.held(), Amount::from_scaled(0));
     }
 
     #[test]
@@ -601,7 +634,9 @@ mod tests {
         let result = engine.apply(dispute(1, 999));
         assert!(matches!(
             result,
-            Err(EngineError::Dispute(DisputeError::TxNotFound(999)))
+            Err(EngineError::DepositOperation(
+                DepositOperationError::TxNotFound(DepositOperation::Dispute, 999)
+            ))
         ));
     }
 
@@ -614,7 +649,9 @@ mod tests {
         let result = engine.apply(dispute(2, 1)); // tx 1 belongs to client 1
         assert!(matches!(
             result,
-            Err(EngineError::Dispute(DisputeError::ClientMismatch(1, 1, 2)))
+            Err(EngineError::DepositOperation(
+                DepositOperationError::ClientMismatch(DepositOperation::Dispute, 1, 1, 2)
+            ))
         ));
     }
 
@@ -627,7 +664,9 @@ mod tests {
         let result = engine.apply(dispute(1, 1));
         assert!(matches!(
             result,
-            Err(EngineError::Dispute(DisputeError::AlreadyDisputed(1)))
+            Err(EngineError::DepositOperation(
+                DepositOperationError::InvalidState(DepositOperation::Dispute, 1)
+            ))
         ));
     }
 
@@ -642,8 +681,8 @@ mod tests {
 
         // Available is now negative (-60), held is 100
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(-60));
-        assert_eq!(client.held, Amount::from_scaled(100));
+        assert_eq!(client.available(), Amount::from_scaled(-60));
+        assert_eq!(client.held(), Amount::from_scaled(100));
         assert_eq!(client.total(), Amount::from_scaled(40)); // total unchanged
     }
 
@@ -657,9 +696,9 @@ mod tests {
         engine.apply(resolve(1, 1)).unwrap();
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(100));
-        assert_eq!(client.held, Amount::from_scaled(0));
-        assert!(!client.frozen);
+        assert_eq!(client.available(), Amount::from_scaled(100));
+        assert_eq!(client.held(), Amount::from_scaled(0));
+        assert!(!client.is_frozen());
     }
 
     #[test]
@@ -670,7 +709,9 @@ mod tests {
         let result = engine.apply(resolve(1, 1));
         assert!(matches!(
             result,
-            Err(EngineError::Resolve(ResolveError::NotDisputed(1)))
+            Err(EngineError::DepositOperation(
+                DepositOperationError::InvalidState(DepositOperation::Resolve, 1)
+            ))
         ));
     }
 
@@ -683,8 +724,8 @@ mod tests {
         engine.apply(dispute(1, 1)).unwrap(); // should succeed
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(0));
-        assert_eq!(client.held, Amount::from_scaled(100));
+        assert_eq!(client.available(), Amount::from_scaled(0));
+        assert_eq!(client.held(), Amount::from_scaled(100));
     }
 
     // Chargeback tests
@@ -697,10 +738,10 @@ mod tests {
         engine.apply(chargeback(1, 1)).unwrap();
 
         let client = engine.get_client(1).unwrap();
-        assert_eq!(client.available, Amount::from_scaled(0));
-        assert_eq!(client.held, Amount::from_scaled(0));
+        assert_eq!(client.available(), Amount::from_scaled(0));
+        assert_eq!(client.held(), Amount::from_scaled(0));
         assert_eq!(client.total(), Amount::from_scaled(0));
-        assert!(client.frozen);
+        assert!(client.is_frozen());
     }
 
     #[test]
@@ -711,7 +752,9 @@ mod tests {
         let result = engine.apply(chargeback(1, 1));
         assert!(matches!(
             result,
-            Err(EngineError::Chargeback(ChargebackError::NotDisputed(1)))
+            Err(EngineError::DepositOperation(
+                DepositOperationError::InvalidState(DepositOperation::Chargeback, 1)
+            ))
         ));
     }
 
@@ -726,7 +769,9 @@ mod tests {
         let result = engine.apply(dispute(1, 1));
         assert!(matches!(
             result,
-            Err(EngineError::Dispute(DisputeError::TxNotFound(1)))
+            Err(EngineError::DepositOperation(
+                DepositOperationError::TxNotFound(DepositOperation::Dispute, 1)
+            ))
         ));
     }
 

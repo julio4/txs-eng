@@ -55,6 +55,14 @@ impl std::ops::AddAssign for Amount {
     }
 }
 
+impl std::ops::Sub for Amount {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Amount(self.0 - rhs.0)
+    }
+}
+
 impl std::ops::SubAssign for Amount {
     fn sub_assign(&mut self, rhs: Self) {
         self.0 -= rhs.0;
@@ -120,6 +128,13 @@ mod tests {
         let mut a = Amount::from_scaled(100);
         a += Amount::from_scaled(50);
         assert_eq!(a, Amount::from_scaled(150));
+    }
+
+    #[test]
+    fn sub() {
+        let a = Amount::from_scaled(100);
+        let b = Amount::from_scaled(30);
+        assert_eq!(a - b, Amount::from_scaled(70));
     }
 
     #[test]
