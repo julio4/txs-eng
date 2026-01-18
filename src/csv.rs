@@ -1,3 +1,5 @@
+//! CSV parsing and export for transactions and account state.
+
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
@@ -5,7 +7,7 @@ use thiserror::Error;
 
 use crate::{Amount, ClientId, Transaction, TxId};
 
-/// Errors that can occur when parsing csv rows
+/// Errors that can occur when parsing CSV rows.
 #[derive(Debug, Error)]
 pub enum CsvError {
     #[error("line {line}: failed to parse row: {source}")]
@@ -35,7 +37,10 @@ struct OutputRow {
     locked: bool,
 }
 
-/// Read transactions from a csv file
+/// Read transactions from a CSV file.
+///
+/// Returns an iterator that yields each transaction or an error if parsing fails.
+/// Invalid rows are returned as errors; valid rows continue to be processed.
 pub fn read_transactions(
     path: impl AsRef<Path>,
 ) -> impl Iterator<Item = Result<Transaction, CsvError>> {
@@ -73,6 +78,18 @@ pub fn read_transactions(
                         amount: Amount::from_float(amount),
                     })
                 }
+                "dispute" => Ok(Transaction::Dispute {
+                    client: row.client,
+                    tx: row.tx,
+                }),
+                "resolve" => Ok(Transaction::Resolve {
+                    client: row.client,
+                    tx: row.tx,
+                }),
+                "chargeback" => Ok(Transaction::Chargeback {
+                    client: row.client,
+                    tx: row.tx,
+                }),
                 other => Err(CsvError::UnrecognizedType {
                     line,
                     tx_type: other.to_string(),
@@ -81,7 +98,9 @@ pub fn read_transactions(
         })
 }
 
-/// write client accounts to stdout in csv format
+/// Write client accounts to stdout in CSV format.
+///
+/// Output columns: client, available, held, total, locked
 pub fn write_accounts(
     accounts: impl IntoIterator<Item = (ClientId, Amount, Amount, Amount, bool)>,
 ) {
@@ -172,5 +191,53 @@ mod tests {
         assert_eq!(results.len(), 1);
         let err = results[0].as_ref().unwrap_err();
         assert!(matches!(err, CsvError::MissingAmount { line: 2, .. }));
+    }
+
+    #[test]
+    fn read_dispute() {
+        let file = write_csv("type,client,tx,amount\ndispute,1,5,\n");
+        let results: Vec<_> = read_transactions(file.path()).collect();
+        assert_eq!(results.len(), 1);
+
+        let tx = results.into_iter().next().unwrap().unwrap();
+        match tx {
+            Transaction::Dispute { client, tx } => {
+                assert_eq!(client, 1);
+                assert_eq!(tx, 5);
+            }
+            _ => panic!("expected dispute"),
+        }
+    }
+
+    #[test]
+    fn read_resolve() {
+        let file = write_csv("type,client,tx,amount\nresolve,2,10,\n");
+        let results: Vec<_> = read_transactions(file.path()).collect();
+        assert_eq!(results.len(), 1);
+
+        let tx = results.into_iter().next().unwrap().unwrap();
+        match tx {
+            Transaction::Resolve { client, tx } => {
+                assert_eq!(client, 2);
+                assert_eq!(tx, 10);
+            }
+            _ => panic!("expected resolve"),
+        }
+    }
+
+    #[test]
+    fn read_chargeback() {
+        let file = write_csv("type,client,tx,amount\nchargeback,3,15,\n");
+        let results: Vec<_> = read_transactions(file.path()).collect();
+        assert_eq!(results.len(), 1);
+
+        let tx = results.into_iter().next().unwrap().unwrap();
+        match tx {
+            Transaction::Chargeback { client, tx } => {
+                assert_eq!(client, 3);
+                assert_eq!(tx, 15);
+            }
+            _ => panic!("expected chargeback"),
+        }
     }
 }

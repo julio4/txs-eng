@@ -1,16 +1,25 @@
+//! Fixed-point decimal type for balance calculation.
+
 use std::fmt;
 
 /// Fixed-point decimal with 4 decimal places, stored as a scaled integer.
+///
+/// Uses i64 internally to avoid any floating-point precision issues.
+/// The value is scaled by 10,000, so `1.0` is stored as `10000`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Amount(i64);
 
 impl Amount {
     const SCALE: i64 = 10_000;
 
+    /// Create an Amount from a floating-point value.
+    ///
+    /// The value is rounded to 4 decimal places.
     pub fn from_float(value: f64) -> Self {
         Amount((value * Self::SCALE as f64).round() as i64)
     }
 
+    /// Create an Amount from a pre-scaled integer value.
     pub fn from_scaled(value: i64) -> Self {
         Amount(value)
     }
